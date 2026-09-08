@@ -42,13 +42,17 @@ The script downloads the ReShade 6.8.0 headers and builds the add-on.
 
 ## Install
 
-Copy:
+Rename:
 
-`build\Release\MagpieReShadeInput.dll`
+`MagpieReShadeInput.dll` to `MagpieReShadeInput.addon64`
 
-to the directory ReShade scans for add-ons (normally next to the ReShade DLL / configured add-on path).
+and put it at the directory ./addons
 
 Then restart Magpie.
+(Make sure you have
+[ADDON]
+AddonPath=.\addons
+In reshade.ini)
 
 ## Usage
 
