@@ -1,4 +1,3 @@
-
 #include <windows.h>
 #include <atomic>
 #include <thread>
@@ -6,63 +5,62 @@
 #include <vector>
 #include "reshade.hpp"
 
-static std::atomic<bool> g_running{true};
-static std::atomic<bool> g_enabled{false};
-static std::atomic<bool> g_busy{false};
+static std::atomic<bool> g_running{ true };
+static std::atomic<bool> g_enabled{ false };
+static std::atomic<bool> g_busy{ false };
 
 static HWND g_magpie = nullptr;
-static LONG_PTR g_oldExStyle = 0;
-static LONG_PTR g_oldStyle = 0;
-static HWND g_previousForeground = nullptr;
+static HWND g_previous_foreground = nullptr;
 
-// Change this if you want another toggle key.
-// F10 is deliberately different from ReShade's Home key.
+static LONG_PTR g_saved_exstyle = 0;
+static LONG_PTR g_saved_style = 0;
+
 static constexpr int TOGGLE_KEY = VK_F10;
 
+// Find Magpie renderer window directly by its window class.
 static HWND FindMagpieRenderer()
 {
-    HWND result = nullptr;
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
-        char cls[256]{};
-        GetClassNameA(hwnd, cls, sizeof(cls));
+    HWND hwnd = FindWindowW(L"Magpie_Renderer", nullptr);
 
-        if (strcmp(cls, "Magpie_Renderer") == 0 && IsWindowVisible(hwnd))
-        {
-            *reinterpret_cast<HWND *>(lp) = hwnd;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&result));
-    return result;
+    if (hwnd && IsWindow(hwnd))
+        return hwnd;
+
+    return nullptr;
 }
 
+// Find the window behind Magpie in the Z-order.
 static HWND FindWindowBehind(HWND renderer)
 {
     if (!renderer)
         return nullptr;
 
-    // Magpie's renderer is normally above the source window in Z-order.
-    HWND h = GetWindow(renderer, GW_HWNDNEXT);
-    while (h)
+    HWND hwnd = GetWindow(renderer, GW_HWNDNEXT);
+
+    while (hwnd)
     {
-        if (IsWindowVisible(h) && IsWindowEnabled(h))
+        if (IsWindow(hwnd) &&
+            IsWindowVisible(hwnd) &&
+            IsWindowEnabled(hwnd))
         {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(h, &pid);
+            wchar_t class_name[256]{};
+            GetClassNameW(hwnd, class_name, 256);
 
-            // Prefer a window belonging to another process (the game/source).
-            if (pid != GetCurrentProcessId())
+            if (wcscmp(class_name, L"Progman") != 0 &&
+                wcscmp(class_name, L"WorkerW") != 0 &&
+                wcscmp(class_name, L"Shell_TrayWnd") != 0)
             {
-                char cls[256]{};
-                GetClassNameA(h, cls, sizeof(cls));
+                DWORD renderer_pid = 0;
+                DWORD window_pid = 0;
 
-                if (strcmp(cls, "Progman") != 0 &&
-                    strcmp(cls, "WorkerW") != 0 &&
-                    strcmp(cls, "Shell_TrayWnd") != 0)
-                    return h;
+                GetWindowThreadProcessId(renderer, &renderer_pid);
+                GetWindowThreadProcessId(hwnd, &window_pid);
+
+                if (window_pid != renderer_pid)
+                    return hwnd;
             }
         }
-        h = GetWindow(h, GW_HWNDNEXT);
+
+        hwnd = GetWindow(hwnd, GW_HWNDNEXT);
     }
 
     return nullptr;
@@ -70,36 +68,42 @@ static HWND FindWindowBehind(HWND renderer)
 
 static void ActivateWindow(HWND hwnd)
 {
-    if (!hwnd)
+    if (!hwnd || !IsWindow(hwnd))
         return;
 
-    HWND fg = GetForegroundWindow();
-    DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-    DWORD myThread = GetCurrentThreadId();
+    DWORD current_thread = GetCurrentThreadId();
+    DWORD target_thread = GetWindowThreadProcessId(hwnd, nullptr);
+    DWORD foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
 
-    if (fgThread && fgThread != myThread)
-        AttachThreadInput(fgThread, myThread, TRUE);
+    if (foreground_thread != current_thread)
+        AttachThreadInput(current_thread, foreground_thread, TRUE);
+
+    if (target_thread != current_thread)
+        AttachThreadInput(current_thread, target_thread, TRUE);
 
     BringWindowToTop(hwnd);
     SetForegroundWindow(hwnd);
     SetActiveWindow(hwnd);
 
-    if (fgThread && fgThread != myThread)
-        AttachThreadInput(fgThread, myThread, FALSE);
+    if (target_thread != current_thread)
+        AttachThreadInput(current_thread, target_thread, FALSE);
+
+    if (foreground_thread != current_thread)
+        AttachThreadInput(current_thread, foreground_thread, FALSE);
 }
 
 static void SendHome()
 {
-    INPUT in[2]{};
+    INPUT inputs[2]{};
 
-    in[0].type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_HOME;
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_HOME;
 
-    in[1].type = INPUT_KEYBOARD;
-    in[1].ki.wVk = VK_HOME;
-    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_HOME;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
 
-    SendInput(2, in, sizeof(INPUT));
+    SendInput(2, inputs, sizeof(INPUT));
 }
 
 static void EnablePassthrough()
@@ -107,43 +111,54 @@ static void EnablePassthrough()
     if (g_busy.exchange(true))
         return;
 
-    HWND hwnd = FindMagpieRenderer();
-    if (!hwnd)
+    HWND renderer = FindMagpieRenderer();
+
+    if (!renderer)
     {
         reshade::log::message(
             reshade::log::level::warning,
-            "Magpie ReShade Input: Magpie_Renderer not found.");
+            "Magpie ReShade Input: Magpie_Renderer not found."
+        );
+
         g_busy = false;
         return;
     }
 
-    g_magpie = hwnd;
-    g_previousForeground = GetForegroundWindow();
+    g_magpie = renderer;
+    g_previous_foreground = GetForegroundWindow();
 
-    g_oldExStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-    g_oldStyle = GetWindowLongPtr(hwnd, GWL_STYLE);
+    g_saved_exstyle = GetWindowLongPtrW(renderer, GWL_EXSTYLE);
+    g_saved_style = GetWindowLongPtrW(renderer, GWL_STYLE);
 
-    // Magpie deliberately uses NOACTIVATE. ReShade needs the renderer
-    // window to become the active input window for its overlay.
-    LONG_PTR ex = g_oldExStyle;
-    ex &= ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE);
-    ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    LONG_PTR exstyle = g_saved_exstyle;
 
-    SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
-    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    exstyle &= ~WS_EX_NOACTIVATE;
+    exstyle &= ~WS_EX_TRANSPARENT;
 
-    ActivateWindow(hwnd);
+    SetWindowLongPtrW(renderer, GWL_EXSTYLE, exstyle);
 
-    // Give Windows/ReShade a moment to observe the new foreground window.
+    SetWindowPos(
+        renderer,
+        HWND_TOP,
+        0, 0, 0, 0,
+        SWP_NOMOVE |
+        SWP_NOSIZE |
+        SWP_NOOWNERZORDER |
+        SWP_FRAMECHANGED
+    );
+
+    ActivateWindow(renderer);
+
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
     SendHome();
 
     g_enabled = true;
+
     reshade::log::message(
         reshade::log::level::info,
-        "Magpie ReShade Input: passthrough ON (F10).");
+        "Magpie ReShade Input: passthrough ON (F10)."
+    );
 
     g_busy = false;
 }
@@ -153,44 +168,71 @@ static void DisablePassthrough()
     if (g_busy.exchange(true))
         return;
 
-    HWND hwnd = g_magpie;
-    if (hwnd && IsWindow(hwnd))
+    if (!g_magpie || !IsWindow(g_magpie))
     {
-        // Close ReShade overlay first.
-        SendHome();
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-
-        SetWindowLongPtr(hwnd, GWL_EXSTYLE, g_oldExStyle);
-        SetWindowLongPtr(hwnd, GWL_STYLE, g_oldStyle);
-        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        g_enabled = false;
+        g_busy = false;
+        return;
     }
 
-    HWND target = FindWindowBehind(hwnd);
-    if (target)
-        ActivateWindow(target);
-    else if (g_previousForeground && IsWindow(g_previousForeground))
-        ActivateWindow(g_previousForeground);
+    SendHome();
 
-    g_magpie = nullptr;
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+    SetWindowLongPtrW(
+        g_magpie,
+        GWL_EXSTYLE,
+        g_saved_exstyle
+    );
+
+    SetWindowLongPtrW(
+        g_magpie,
+        GWL_STYLE,
+        g_saved_style
+    );
+
+    SetWindowPos(
+        g_magpie,
+        nullptr,
+        0, 0, 0, 0,
+        SWP_NOMOVE |
+        SWP_NOSIZE |
+        SWP_NOZORDER |
+        SWP_NOOWNERZORDER |
+        SWP_FRAMECHANGED
+    );
+
+    HWND behind = FindWindowBehind(g_magpie);
+
+    if (behind)
+        ActivateWindow(behind);
+    else if (g_previous_foreground &&
+             IsWindow(g_previous_foreground))
+        ActivateWindow(g_previous_foreground);
+
     g_enabled = false;
 
     reshade::log::message(
         reshade::log::level::info,
-        "Magpie ReShade Input: passthrough OFF (F10).");
+        "Magpie ReShade Input: passthrough OFF (F10)."
+    );
+
+    g_magpie = nullptr;
+    g_previous_foreground = nullptr;
 
     g_busy = false;
 }
 
 static void Worker()
 {
-    bool last = false;
+    bool previous_key_state = false;
 
     while (g_running)
     {
-        const bool down = (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
+        bool key_state =
+            (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
 
-        if (down && !last && !g_busy)
+        if (key_state && !previous_key_state)
         {
             if (g_enabled)
                 DisablePassthrough();
@@ -198,51 +240,39 @@ static void Worker()
                 EnablePassthrough();
         }
 
-        last = down;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        previous_key_state = key_state;
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10)
+        );
     }
 }
 
-extern "C" __declspec(dllexport) const char *NAME =
-    "Magpie ReShade Input Passthrough";
-
-extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Makes the Magpie renderer focusable so ReShade's overlay can receive keyboard and mouse input.";
-
-static HMODULE g_module = nullptr;
-
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(
+    HMODULE hModule,
+    DWORD reason,
+    LPVOID
+)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        g_module = hModule;
-
-        if (!reshade::register_addon(hModule))
-            return FALSE;
-
         DisableThreadLibraryCalls(hModule);
+
+        reshade::register_addon(hModule);
 
         std::thread(Worker).detach();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
         g_running = false;
-
-        if (g_enabled)
-        {
-            // Best effort cleanup. Avoid waiting here.
-            HWND hwnd = g_magpie;
-            if (hwnd && IsWindow(hwnd))
-            {
-                SetWindowLongPtr(hwnd, GWL_EXSTYLE, g_oldExStyle);
-                SetWindowLongPtr(hwnd, GWL_STYLE, g_oldStyle);
-                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-            }
-        }
-
-        reshade::unregister_addon(hModule);
     }
 
     return TRUE;
 }
+
+extern "C" __declspec(dllexport)
+const char *NAME = "Magpie ReShade Input Passthrough";
+
+extern "C" __declspec(dllexport)
+const char *DESCRIPTION =
+    "Allows ReShade overlay input passthrough to Magpie.";
