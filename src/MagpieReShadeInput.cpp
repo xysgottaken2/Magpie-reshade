@@ -32,27 +32,28 @@ struct WindowState
 static std::map<HWND, WindowState> g_windows;
 static std::mutex g_windowsMutex;
 
-static bool IsOurProcessWindow(HWND hwnd)
-{
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    return pid == GetCurrentProcessId();
-}
-
 struct SearchContext
 {
     HWND found = nullptr;
 };
 
+static bool IsRenderer(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+
+    wchar_t className[256]{};
+    const int length = GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    return length > 0 && wcscmp(className, RENDERER_CLASS) == 0;
+}
+
 static BOOL CALLBACK FindRendererChildProc(HWND hwnd, LPARAM lParam)
 {
     auto *ctx = reinterpret_cast<SearchContext *>(lParam);
-    if (!ctx || !IsOurProcessWindow(hwnd))
+    if (!ctx)
         return TRUE;
 
-    wchar_t className[256]{};
-    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0 &&
-        wcscmp(className, RENDERER_CLASS) == 0)
+    if (IsRenderer(hwnd))
     {
         ctx->found = hwnd;
         return FALSE;
@@ -64,26 +65,44 @@ static BOOL CALLBACK FindRendererChildProc(HWND hwnd, LPARAM lParam)
 static BOOL CALLBACK FindRendererTopProc(HWND hwnd, LPARAM lParam)
 {
     auto *ctx = reinterpret_cast<SearchContext *>(lParam);
-    if (!ctx || !IsOurProcessWindow(hwnd))
+    if (!ctx)
         return TRUE;
 
-    wchar_t className[256]{};
-    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0 &&
-        wcscmp(className, RENDERER_CLASS) == 0)
+    if (IsRenderer(hwnd))
     {
         ctx->found = hwnd;
         return FALSE;
     }
 
+    // EnumChildWindows recursively enumerates descendants of this top-level
+    // window. Do not filter by process here: the registered Magpie renderer
+    // class is the identifying signal and this also handles unusual ownership
+    // arrangements used by the compositor.
     EnumChildWindows(hwnd, FindRendererChildProc, lParam);
     return ctx->found ? FALSE : TRUE;
 }
 
 static HWND FindRendererRecursive()
 {
+    // First try the normal top-level/child window hierarchy.
     SearchContext context{};
     EnumWindows(FindRendererTopProc, reinterpret_cast<LPARAM>(&context));
-    return context.found;
+    if (context.found)
+        return context.found;
+
+    // Also check message-only windows. This is cheap and covers renderers that
+    // are created on a message-only window station instead of the visible tree.
+    HWND current = nullptr;
+    while ((current = FindWindowExW(
+        HWND_MESSAGE,
+        current,
+        RENDERER_CLASS,
+        nullptr)) != nullptr)
+    {
+        return current;
+    }
+
+    return nullptr;
 }
 
 static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -138,13 +157,16 @@ static void LogWindowInfo(HWND hwnd)
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     HWND parent = GetParent(hwnd);
+    DWORD pid = 0;
+    const DWORD ownerPid = GetWindowThreadProcessId(hwnd, &pid) ? pid : 0;
 
-    char message[256]{};
+    char message[320]{};
     sprintf_s(
         message,
-        "Magpie ReShade Input: renderer=%p parent=%p style=0x%llX exstyle=0x%llX",
+        "Magpie ReShade Input: renderer=%p parent=%p pid=%lu style=0x%llX exstyle=0x%llX",
         static_cast<void *>(hwnd),
         static_cast<void *>(parent),
+        static_cast<unsigned long>(ownerPid),
         static_cast<unsigned long long>(style),
         static_cast<unsigned long long>(exStyle));
 
@@ -153,7 +175,7 @@ static void LogWindowInfo(HWND hwnd)
 
 static bool HookRenderer(HWND hwnd)
 {
-    if (!hwnd || !IsWindow(hwnd) || !IsOurProcessWindow(hwnd))
+    if (!hwnd || !IsWindow(hwnd) || !IsRenderer(hwnd))
         return false;
 
     WNDPROC currentProc = reinterpret_cast<WNDPROC>(
@@ -175,13 +197,16 @@ static bool HookRenderer(HWND hwnd)
         g_windows[hwnd] = state;
     }
 
-    if (!IsWindow(hwnd))
-        return false;
-
-    SetWindowLongPtrW(
+    if (SetWindowLongPtrW(
         hwnd,
         GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(HookProc));
+        reinterpret_cast<LONG_PTR>(HookProc)) == 0 &&
+        GetLastError() != ERROR_SUCCESS)
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        g_windows.erase(hwnd);
+        return false;
+    }
 
     // Only remove click-through/non-activating bits if present. Never touch
     // WS_EX_LAYERED, since Magpie's compositor may depend on it.
@@ -285,9 +310,6 @@ static void FocusRenderer(HWND hwnd)
     BringWindowToTop(root);
     SetForegroundWindow(root);
 
-    // SetFocus only works directly when the caller and target share a GUI
-    // thread. Do not use AttachThreadInput here; the renderer can be owned by
-    // another thread and forcing input attachment can destabilize Magpie.
     if (GetWindowThreadProcessId(root, nullptr) == GetCurrentThreadId())
         SetFocus(hwnd);
 }
