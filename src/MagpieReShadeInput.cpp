@@ -10,8 +10,12 @@
 #include "reshade.hpp"
 
 // Magpie/ReShade input passthrough.
-// Locate the exact Magpie renderer window, including child windows, and hook
-// only that window. Avoid modifying unrelated Magpie windows.
+// Magpie creates its actual renderer as a CHILD window with
+// WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP.
+// The class is registered as Magpie_Renderer, but locating that class by
+// normal top-level enumeration is unreliable in this setup. We therefore
+// identify the renderer by the click-through style combination used by
+// Magpie itself, while restricting the search to this process.
 
 static std::atomic<bool> g_running{ true };
 static std::atomic<bool> g_inputPassthrough{ false };
@@ -37,14 +41,37 @@ struct SearchContext
     HWND found = nullptr;
 };
 
-static bool IsRenderer(HWND hwnd)
+static bool IsCurrentProcessWindow(HWND hwnd)
 {
     if (!hwnd || !IsWindow(hwnd))
         return false;
 
+    DWORD pid = 0;
+    return GetWindowThreadProcessId(hwnd, &pid) != 0 &&
+           pid == GetCurrentProcessId();
+}
+
+static bool IsRendererClass(HWND hwnd)
+{
     wchar_t className[256]{};
     const int length = GetClassNameW(hwnd, className, ARRAYSIZE(className));
     return length > 0 && wcscmp(className, RENDERER_CLASS) == 0;
+}
+
+static bool IsRendererCandidate(HWND hwnd)
+{
+    if (!IsCurrentProcessWindow(hwnd))
+        return false;
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+    // This is the important part: Magpie's renderer child is created with
+    // WS_EX_LAYERED | WS_EX_TRANSPARENT. Do not touch ordinary Magpie windows
+    // merely because they are layered; require click-through as well.
+    const bool clickThrough = (exStyle & WS_EX_TRANSPARENT) != 0;
+    const bool layered = (exStyle & WS_EX_LAYERED) != 0;
+
+    return IsRendererClass(hwnd) || (clickThrough && layered);
 }
 
 static BOOL CALLBACK FindRendererChildProc(HWND hwnd, LPARAM lParam)
@@ -53,7 +80,7 @@ static BOOL CALLBACK FindRendererChildProc(HWND hwnd, LPARAM lParam)
     if (!ctx)
         return TRUE;
 
-    if (IsRenderer(hwnd))
+    if (IsRendererCandidate(hwnd))
     {
         ctx->found = hwnd;
         return FALSE;
@@ -68,38 +95,33 @@ static BOOL CALLBACK FindRendererTopProc(HWND hwnd, LPARAM lParam)
     if (!ctx)
         return TRUE;
 
-    if (IsRenderer(hwnd))
+    if (IsRendererCandidate(hwnd))
     {
         ctx->found = hwnd;
         return FALSE;
     }
 
-    // EnumChildWindows recursively enumerates descendants of this top-level
-    // window. Do not filter by process here: the registered Magpie renderer
-    // class is the identifying signal and this also handles unusual ownership
-    // arrangements used by the compositor.
     EnumChildWindows(hwnd, FindRendererChildProc, lParam);
     return ctx->found ? FALSE : TRUE;
 }
 
 static HWND FindRendererRecursive()
 {
-    // First try the normal top-level/child window hierarchy.
     SearchContext context{};
     EnumWindows(FindRendererTopProc, reinterpret_cast<LPARAM>(&context));
     if (context.found)
         return context.found;
 
-    // Also check message-only windows. This is cheap and covers renderers that
-    // are created on a message-only window station instead of the visible tree.
+    // Message-only windows are uncommon here, but keep this fallback.
     HWND current = nullptr;
     while ((current = FindWindowExW(
         HWND_MESSAGE,
         current,
-        RENDERER_CLASS,
+        nullptr,
         nullptr)) != nullptr)
     {
-        return current;
+        if (IsRendererCandidate(current))
+            return current;
     }
 
     return nullptr;
@@ -125,8 +147,6 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
-    // Do not force a Windows cursor here. ReShade draws its own ImGui cursor
-    // when the overlay is open; forcing IDC_ARROW caused cursor conflicts.
     if (g_inputPassthrough && msg == WM_MOUSEMOVE)
         ClipCursor(nullptr);
 
@@ -137,8 +157,8 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         wParam,
         lParam);
 
-    // Convert a deliberate transparent hit-test into a client hit-test while
-    // passthrough is active so mouse interaction can reach ReShade.
+    // Magpie intentionally returns transparent hit-tests for its renderer.
+    // While passthrough is active, turn that into a normal client hit-test.
     if (g_inputPassthrough &&
         msg == WM_NCHITTEST &&
         result == HTTRANSPARENT)
@@ -154,17 +174,21 @@ static void LogWindowInfo(HWND hwnd)
     if (!hwnd || !IsWindow(hwnd))
         return;
 
+    wchar_t className[256]{};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     HWND parent = GetParent(hwnd);
     DWORD pid = 0;
     const DWORD ownerPid = GetWindowThreadProcessId(hwnd, &pid) ? pid : 0;
 
-    char message[320]{};
+    char message[512]{};
     sprintf_s(
         message,
-        "Magpie ReShade Input: renderer=%p parent=%p pid=%lu style=0x%llX exstyle=0x%llX",
+        "Magpie ReShade Input: renderer=%p class=%ls parent=%p pid=%lu style=0x%llX exstyle=0x%llX",
         static_cast<void *>(hwnd),
+        className,
         static_cast<void *>(parent),
         static_cast<unsigned long>(ownerPid),
         static_cast<unsigned long long>(style),
@@ -175,7 +199,7 @@ static void LogWindowInfo(HWND hwnd)
 
 static bool HookRenderer(HWND hwnd)
 {
-    if (!hwnd || !IsWindow(hwnd) || !IsRenderer(hwnd))
+    if (!hwnd || !IsWindow(hwnd) || !IsRendererCandidate(hwnd))
         return false;
 
     WNDPROC currentProc = reinterpret_cast<WNDPROC>(
@@ -197,21 +221,25 @@ static bool HookRenderer(HWND hwnd)
         g_windows[hwnd] = state;
     }
 
-    if (SetWindowLongPtrW(
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previousProc = SetWindowLongPtrW(
         hwnd,
         GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(HookProc)) == 0 &&
-        GetLastError() != ERROR_SUCCESS)
+        reinterpret_cast<LONG_PTR>(HookProc));
+
+    if (previousProc == 0 && GetLastError() != ERROR_SUCCESS)
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
         g_windows.erase(hwnd);
         return false;
     }
 
-    // Only remove click-through/non-activating bits if present. Never touch
-    // WS_EX_LAYERED, since Magpie's compositor may depend on it.
-    LONG_PTR newExStyle = state.originalExStyle &
-        ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    // This mirrors the mechanism used by LSP-ReShade, but only for the
+    // single Magpie renderer candidate. Magpie explicitly creates this child
+    // as layered + transparent + non-activating so mouse input passes through.
+    // Removing these flags is what actually makes the ReShade UI clickable.
+    const LONG_PTR newExStyle = state.originalExStyle &
+        ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED);
 
     if (newExStyle != state.originalExStyle)
     {
@@ -307,11 +335,19 @@ static void FocusRenderer(HWND hwnd)
     if (!root)
         root = hwnd;
 
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    DWORD currentThread = GetCurrentThreadId();
+
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(foregroundThread, currentThread, TRUE);
+
     BringWindowToTop(root);
     SetForegroundWindow(root);
+    SetFocus(hwnd);
 
-    if (GetWindowThreadProcessId(root, nullptr) == GetCurrentThreadId())
-        SetFocus(hwnd);
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(foregroundThread, currentThread, FALSE);
 }
 
 static void EnablePassthrough()
@@ -321,7 +357,7 @@ static void EnablePassthrough()
 
     reshade::log::message(
         reshade::log::level::info,
-        "Magpie ReShade Input: locating Magpie_Renderer..."
+        "Magpie ReShade Input: locating Magpie renderer by click-through styles..."
     );
 
     HWND renderer = FindRendererRecursive();
@@ -330,7 +366,7 @@ static void EnablePassthrough()
     {
         reshade::log::message(
             reshade::log::level::warning,
-            "Magpie ReShade Input: Magpie_Renderer not found."
+            "Magpie ReShade Input: no layered+transparent Magpie renderer found."
         );
         g_busy = false;
         return;
@@ -342,7 +378,7 @@ static void EnablePassthrough()
     {
         reshade::log::message(
             reshade::log::level::warning,
-            "Magpie ReShade Input: failed to hook Magpie_Renderer."
+            "Magpie ReShade Input: failed to hook renderer."
         );
         g_busy = false;
         return;
@@ -350,10 +386,8 @@ static void EnablePassthrough()
 
     g_inputPassthrough = true;
 
-    // Focus the renderer before sending Home so ReShade gets its overlay
-    // hotkey rather than the source application.
     FocusRenderer(renderer);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
     SendHome();
 
     reshade::log::message(
@@ -373,7 +407,6 @@ static void DisablePassthrough()
 
     SendHome();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
     RestoreAllWindows();
 
     reshade::log::message(
