@@ -5,19 +5,18 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include <cwchar>
+#include <cstdio>
 #include "reshade.hpp"
 
 // Magpie/ReShade input passthrough.
-//
-// The renderer is not necessarily a top-level window. Magpie can create
-// Magpie_Renderer as a child/owned window, so searching only with FindWindowW
-// or filtering by WS_EX_TRANSPARENT/WS_EX_NOACTIVATE can miss the real target.
-// We therefore locate the exact renderer class recursively and only subclass
-// that window. This is intentionally much narrower than the old broad scan.
+// Locate the exact Magpie renderer window, including child windows, and hook
+// only that window. Avoid modifying unrelated Magpie windows.
 
 static std::atomic<bool> g_running{ true };
 static std::atomic<bool> g_inputPassthrough{ false };
 static std::atomic<bool> g_busy{ false };
+static std::atomic<HWND> g_renderer{ nullptr };
 
 static constexpr int TOGGLE_KEY = VK_F10;
 static constexpr wchar_t RENDERER_CLASS[] = L"Magpie_Renderer";
@@ -32,7 +31,60 @@ struct WindowState
 
 static std::map<HWND, WindowState> g_windows;
 static std::mutex g_windowsMutex;
-static std::atomic<HWND> g_renderer{ nullptr };
+
+static bool IsOurProcessWindow(HWND hwnd)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+struct SearchContext
+{
+    HWND found = nullptr;
+};
+
+static BOOL CALLBACK FindRendererChildProc(HWND hwnd, LPARAM lParam)
+{
+    auto *ctx = reinterpret_cast<SearchContext *>(lParam);
+    if (!ctx || !IsOurProcessWindow(hwnd))
+        return TRUE;
+
+    wchar_t className[256]{};
+    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0 &&
+        wcscmp(className, RENDERER_CLASS) == 0)
+    {
+        ctx->found = hwnd;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL CALLBACK FindRendererTopProc(HWND hwnd, LPARAM lParam)
+{
+    auto *ctx = reinterpret_cast<SearchContext *>(lParam);
+    if (!ctx || !IsOurProcessWindow(hwnd))
+        return TRUE;
+
+    wchar_t className[256]{};
+    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) > 0 &&
+        wcscmp(className, RENDERER_CLASS) == 0)
+    {
+        ctx->found = hwnd;
+        return FALSE;
+    }
+
+    EnumChildWindows(hwnd, FindRendererChildProc, lParam);
+    return ctx->found ? FALSE : TRUE;
+}
+
+static HWND FindRendererRecursive()
+{
+    SearchContext context{};
+    EnumWindows(FindRendererTopProc, reinterpret_cast<LPARAM>(&context));
+    return context.found;
+}
 
 static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -55,8 +107,7 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 
     // Do not force a Windows cursor here. ReShade draws its own ImGui cursor
-    // when the overlay is open; forcing IDC_ARROW caused it to fight with the
-    // game's/custom cursor.
+    // when the overlay is open; forcing IDC_ARROW caused cursor conflicts.
     if (g_inputPassthrough && msg == WM_MOUSEMOVE)
         ClipCursor(nullptr);
 
@@ -67,9 +118,8 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         wParam,
         lParam);
 
-    // Renderer/overlay windows may deliberately report HTTRANSPARENT. That
-    // makes mouse input fall through to the source application. While the
-    // passthrough mode is active, make the renderer a normal hit-test target.
+    // Convert a deliberate transparent hit-test into a client hit-test while
+    // passthrough is active so mouse interaction can reach ReShade.
     if (g_inputPassthrough &&
         msg == WM_NCHITTEST &&
         result == HTTRANSPARENT)
@@ -78,59 +128,6 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 
     return result;
-}
-
-static bool IsOurProcessWindow(HWND hwnd)
-{
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    return pid == GetCurrentProcessId();
-}
-
-static HWND FindRendererRecursive()
-{
-    struct SearchContext
-    {
-        HWND found = nullptr;
-    } context;
-
-    auto childProc = [](HWND hwnd, LPARAM lParam) -> BOOL
-    {
-        auto *ctx = reinterpret_cast<SearchContext *>(lParam);
-        if (!IsOurProcessWindow(hwnd))
-            return TRUE;
-
-        wchar_t className[256]{};
-        GetClassNameW(hwnd, className, ARRAYSIZE(className));
-        if (wcscmp(className, RENDERER_CLASS) == 0)
-        {
-            ctx->found = hwnd;
-            return FALSE;
-        }
-
-        return TRUE;
-    };
-
-    auto topProc = [](HWND hwnd, LPARAM lParam) -> BOOL
-    {
-        auto *ctx = reinterpret_cast<SearchContext *>(lParam);
-        if (!IsOurProcessWindow(hwnd))
-            return TRUE;
-
-        wchar_t className[256]{};
-        GetClassNameW(hwnd, className, ARRAYSIZE(className));
-        if (wcscmp(className, RENDERER_CLASS) == 0)
-        {
-            ctx->found = hwnd;
-            return FALSE;
-        }
-
-        EnumChildWindows(hwnd, childProc, lParam);
-        return ctx->found ? FALSE : TRUE;
-    };
-
-    EnumWindows(topProc, reinterpret_cast<LPARAM>(&context));
-    return context.found;
 }
 
 static void LogWindowInfo(HWND hwnd)
@@ -163,7 +160,10 @@ static bool HookRenderer(HWND hwnd)
         GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
 
     if (currentProc == HookProc)
+    {
+        g_renderer = hwnd;
         return true;
+    }
 
     WindowState state;
     state.originalProc = currentProc;
@@ -183,13 +183,12 @@ static bool HookRenderer(HWND hwnd)
         GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(HookProc));
 
-    // Only remove click-through/non-activating bits if they actually exist.
-    // Never touch WS_EX_LAYERED; Magpie's renderer/compositor may depend on it.
-    LONG_PTR exStyle = state.originalExStyle;
-    LONG_PTR newExStyle = exStyle &
+    // Only remove click-through/non-activating bits if present. Never touch
+    // WS_EX_LAYERED, since Magpie's compositor may depend on it.
+    LONG_PTR newExStyle = state.originalExStyle &
         ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
 
-    if (newExStyle != exStyle)
+    if (newExStyle != state.originalExStyle)
     {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, newExStyle);
         SetWindowPos(
@@ -279,8 +278,6 @@ static void FocusRenderer(HWND hwnd)
     if (!hwnd || !IsWindow(hwnd))
         return;
 
-    // The renderer may be a child window. Bring its root to the foreground,
-    // then focus the renderer itself when Windows permits it.
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root)
         root = hwnd;
@@ -288,6 +285,9 @@ static void FocusRenderer(HWND hwnd)
     BringWindowToTop(root);
     SetForegroundWindow(root);
 
+    // SetFocus only works directly when the caller and target share a GUI
+    // thread. Do not use AttachThreadInput here; the renderer can be owned by
+    // another thread and forcing input attachment can destabilize Magpie.
     if (GetWindowThreadProcessId(root, nullptr) == GetCurrentThreadId())
         SetFocus(hwnd);
 }
@@ -328,8 +328,8 @@ static void EnablePassthrough()
 
     g_inputPassthrough = true;
 
-    // Give the renderer focus before sending Home so ReShade receives its
-    // overlay hotkey instead of the source game receiving it.
+    // Focus the renderer before sending Home so ReShade gets its overlay
+    // hotkey rather than the source application.
     FocusRenderer(renderer);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     SendHome();
@@ -380,9 +380,6 @@ static void Worker()
         }
 
         previousKeyState = keyState;
-
-        // Do not continuously rescan or mutate arbitrary Magpie windows while
-        // active. The renderer is stable for the lifetime of a scaling session.
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
 }
