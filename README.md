@@ -65,6 +65,7 @@ Your `reshade.ini` should contain:
 AddonPath=.\addons
 ```
 ⚠️ You will have to drag others addons(.addon64) to that same folder
+
 Restart Magpie after installing the add-on.
 
 ## Using it
