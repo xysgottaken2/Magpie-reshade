@@ -1,5 +1,4 @@
-name: Compilar com CMake
-
+name: Compile with CMAKE
 on: [push, workflow_dispatch]
 
 jobs:
@@ -7,17 +6,23 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Copiar repositório
+    - name: Copy repository
       uses: actions/checkout@v4
 
-    - name: Configurar CMake e Build
+    - name: Download 
+      uses: actions/checkout@v4
+      with:
+        repository: crosire/reshade
+        path: reshade_source
+
+    - name: Configure CMAKE
       run: |
         mkdir build
         cd build
-        cmake .. -A x64
+        cmake .. -A x64 -DRESHADE_INCLUDE_DIR="../reshade_source/include"
         cmake --build . --config Release
 
-    - name: Salvar a DLL gerada (Artifacts)
+    - name: Artefact
       uses: actions/upload-artifact@v4
       with:
         name: MagpieReshadeInput-DLL
