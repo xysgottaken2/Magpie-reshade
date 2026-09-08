@@ -9,12 +9,11 @@
 
 // Magpie/ReShade input passthrough.
 //
-// The previous implementation assumed that Magpie_Renderer was a top-level
-// window. In practice Magpie registers that class, but the actual renderer
-// window may be a child/owned window. This implementation follows the same
-// general approach as LSP-ReShade: enumerate every window belonging to the
-// current Magpie process, including child windows, subclass them, and remove
-// the styles/WM_NCHITTEST behavior that causes click-through.
+// Magpie registers several window classes. The previous implementation was
+// intentionally broad, but changing styles on every window in Magpie.exe can
+// interfere with Magpie's own UI/renderer and crash the process. This version
+// is conservative: it only modifies windows that actually advertise the
+// click-through/no-activate styles, and it never removes WS_EX_LAYERED.
 
 static std::atomic<bool> g_running{ true };
 static std::atomic<bool> g_inputPassthrough{ false };
@@ -51,7 +50,6 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
-
         auto it = g_windows.find(hwnd);
         if (it != g_windows.end())
             originalProc = it->second.originalProc;
@@ -73,9 +71,9 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         wParam,
         lParam);
 
-    // Magpie/overlay windows can deliberately return HTTRANSPARENT to make
-    // mouse input pass through to the application underneath. ReShade needs
-    // the overlay window to receive that input instead.
+    // The important part: Magpie/overlay windows may report HTTRANSPARENT,
+    // which makes mouse input fall through. Convert that result to a normal
+    // client hit so ReShade can receive the mouse interaction.
     if (g_inputPassthrough &&
         msg == WM_NCHITTEST &&
         result == HTTRANSPARENT)
@@ -86,21 +84,29 @@ static LRESULT CALLBACK HookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     return result;
 }
 
-static DWORD GetCurrentProcessIdValue()
-{
-    return GetCurrentProcessId();
-}
-
 static bool IsOurProcessWindow(HWND hwnd)
 {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    return pid == GetCurrentProcessIdValue();
+    return pid == GetCurrentProcessId();
 }
 
 static void ProcessWindow(HWND hwnd)
 {
     if (!hwnd || !IsWindow(hwnd) || !IsOurProcessWindow(hwnd))
+        return;
+
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+
+    // Do not touch ordinary Magpie windows. In particular, do not alter
+    // Magpie's main window or renderer merely because it belongs to the same
+    // process. Only windows that are actually configured as click-through or
+    // non-activating are candidates for passthrough.
+    const bool candidate =
+        (exStyle & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)) != 0;
+
+    if (!candidate)
         return;
 
     WNDPROC currentProc = reinterpret_cast<WNDPROC>(
@@ -110,68 +116,44 @@ static void ProcessWindow(HWND hwnd)
     {
         WindowState state;
         state.originalProc = currentProc;
-        state.originalStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        state.originalExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        state.originalStyle = style;
+        state.originalExStyle = exStyle;
 
         {
             std::lock_guard<std::mutex> lock(g_windowsMutex);
-
-            // Do not overwrite the original WndProc if we already hooked it.
-            auto it = g_windows.find(hwnd);
-            if (it == g_windows.end())
+            if (g_windows.find(hwnd) == g_windows.end())
                 g_windows.emplace(hwnd, state);
         }
+
+        // Re-check that the handle still exists before changing its WndProc.
+        if (!IsWindow(hwnd))
+            return;
 
         SetWindowLongPtrW(
             hwnd,
             GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(HookProc));
-
-        // The window could have been destroyed between enumeration and the
-        // SetWindowLongPtr call. That is harmless; IsWindow is checked again
-        // when restoring.
     }
 
     if (!g_inputPassthrough)
         return;
 
-    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-
-    bool firstActivation = false;
-    LONG_PTR originalExStyle = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_windowsMutex);
-
-        auto it = g_windows.find(hwnd);
-        if (it == g_windows.end())
-            return;
-
-        WindowState &state = it->second;
-
-        if (!state.stylesModified)
-        {
-            state.originalStyle = style;
-            state.originalExStyle = exStyle;
-            state.stylesModified = true;
-            firstActivation = true;
-        }
-
-        originalExStyle = state.originalExStyle;
-    }
-
     LONG_PTR newExStyle = exStyle &
-        ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED);
+        ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
 
+    // Keep WS_EX_LAYERED intact. Magpie can rely on layered composition and
+    // removing it was a likely cause of the immediate crash seen with F10.
     LONG_PTR newStyle = style & ~WS_DISABLED;
 
-    bool changed =
+    const bool changed =
         (newExStyle != exStyle) ||
         (newStyle != style);
 
     if (changed)
     {
+        if (!IsWindow(hwnd))
+            return;
+
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, newExStyle);
         SetWindowLongPtrW(hwnd, GWL_STYLE, newStyle);
 
@@ -185,25 +167,6 @@ static void ProcessWindow(HWND hwnd)
             SWP_NOACTIVATE |
             SWP_FRAMECHANGED);
     }
-
-    // Only force an overlay-style window to the foreground. This avoids
-    // constantly stealing focus from the game while still making the actual
-    // transparent/overlay window interactive.
-    bool isOverlay =
-        (originalExStyle &
-            (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE)) != 0;
-
-    if ((changed || firstActivation) && isOverlay)
-    {
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0, 0, 0, 0,
-            SWP_NOMOVE |
-            SWP_NOSIZE |
-            SWP_FRAMECHANGED |
-            SWP_NOACTIVATE);
-    }
 }
 
 static BOOL CALLBACK EnumChildProc(HWND hwnd, LPARAM)
@@ -215,10 +178,7 @@ static BOOL CALLBACK EnumChildProc(HWND hwnd, LPARAM)
 static BOOL CALLBACK EnumTopLevelProc(HWND hwnd, LPARAM)
 {
     ProcessWindow(hwnd);
-
-    // EnumChildWindows enumerates all descendants of this window.
     EnumChildWindows(hwnd, EnumChildProc, 0);
-
     return TRUE;
 }
 
@@ -246,16 +206,8 @@ static void RestoreAllWindows()
 
         if (state.stylesModified)
         {
-            SetWindowLongPtrW(
-                hwnd,
-                GWL_EXSTYLE,
-                state.originalExStyle);
-
-            SetWindowLongPtrW(
-                hwnd,
-                GWL_STYLE,
-                state.originalStyle);
-
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, state.originalExStyle);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, state.originalStyle);
             SetWindowPos(
                 hwnd,
                 nullptr,
@@ -268,7 +220,6 @@ static void RestoreAllWindows()
         }
 
         LONG_PTR currentProc = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-
         if (currentProc == reinterpret_cast<LONG_PTR>(HookProc))
         {
             SetWindowLongPtrW(
@@ -295,34 +246,6 @@ static void CleanupDeadWindows()
     }
 }
 
-static void ActivateForegroundWindow(HWND hwnd)
-{
-    if (!hwnd || !IsWindow(hwnd))
-        return;
-
-    DWORD currentThread = GetCurrentThreadId();
-    DWORD targetThread = GetWindowThreadProcessId(hwnd, nullptr);
-    HWND foreground = GetForegroundWindow();
-    DWORD foregroundThread =
-        foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
-
-    if (foregroundThread && foregroundThread != currentThread)
-        AttachThreadInput(currentThread, foregroundThread, TRUE);
-
-    if (targetThread && targetThread != currentThread)
-        AttachThreadInput(currentThread, targetThread, TRUE);
-
-    BringWindowToTop(hwnd);
-    SetForegroundWindow(hwnd);
-    SetActiveWindow(hwnd);
-
-    if (targetThread && targetThread != currentThread)
-        AttachThreadInput(currentThread, targetThread, FALSE);
-
-    if (foregroundThread && foregroundThread != currentThread)
-        AttachThreadInput(currentThread, foregroundThread, FALSE);
-}
-
 static void SendHome()
 {
     INPUT inputs[2]{};
@@ -344,11 +267,11 @@ static void EnablePassthrough()
 
     reshade::log::message(
         reshade::log::level::info,
-        "Magpie ReShade Input: scanning Magpie windows..."
+        "Magpie ReShade Input: scanning click-through windows..."
     );
 
-    // Hook all current Magpie windows, including children. This is the key
-    // difference from the old FindWindowW("Magpie_Renderer", ...) approach.
+    // Hook only actual click-through/non-activating windows. This avoids
+    // modifying Magpie's ordinary application windows.
     ProcessAllMagpieWindows();
 
     size_t count = 0;
@@ -357,25 +280,16 @@ static void EnablePassthrough()
         count = g_windows.size();
     }
 
-    if (count == 0)
-    {
-        reshade::log::message(
-            reshade::log::level::warning,
-            "Magpie ReShade Input: no Magpie windows found."
-        );
-
-        g_busy = false;
-        return;
-    }
-
     g_inputPassthrough = true;
 
-    // Apply passthrough styles immediately to the windows we just found.
+    // Apply the minimal style change and WM_NCHITTEST hook.
     ProcessAllMagpieWindows();
 
     reshade::log::message(
         reshade::log::level::info,
-        "Magpie ReShade Input: passthrough ON (F10)."
+        count == 0
+            ? "Magpie ReShade Input: no click-through windows found; WM_NCHITTEST hook active."
+            : "Magpie ReShade Input: passthrough ON (F10)."
     );
 
     g_busy = false;
@@ -408,7 +322,7 @@ static void Worker()
 
     while (g_running)
     {
-        bool keyState =
+        const bool keyState =
             (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
 
         if (keyState && !previousKeyState)
@@ -421,9 +335,6 @@ static void Worker()
 
         previousKeyState = keyState;
 
-        // Magpie can create/recreate renderer/child windows while scaling is
-        // running. Periodically catch those new windows while passthrough is
-        // active.
         if (g_inputPassthrough && !g_busy)
         {
             ProcessAllMagpieWindows();
@@ -436,22 +347,16 @@ static void Worker()
             }
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(25));
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
 }
 
-BOOL APIENTRY DllMain(
-    HMODULE hModule,
-    DWORD reason,
-    LPVOID)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
-
         reshade::register_addon(hModule);
-
         std::thread(Worker).detach();
     }
     else if (reason == DLL_PROCESS_DETACH)
